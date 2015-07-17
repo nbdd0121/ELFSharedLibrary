@@ -212,6 +212,12 @@ static bool ELF32_relocateRel(dl_handle_t* handle, char* reltab, int entsize, in
         Elf32_Sym *symbol = (Elf32_Sym *)(symtab + ELF32_R_SYM(rel->r_info) * syment);
         uint32_t *ref = (uint32_t *)(handle->executable + rel->r_offset);
         switch (ELF32_R_TYPE(rel->r_info)) {
+            case R_386_32:
+                *ref += symbol->st_value;
+                break;
+            case R_386_PC32:
+                *ref += symbol->st_value - (uint32_t)ref;
+                break;
             case R_386_GLOB_DAT:
                 *ref = symbol->st_value;
                 break;

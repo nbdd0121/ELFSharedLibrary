@@ -1,6 +1,7 @@
 /Debug
 /Release
 /x64
+/test
 *.idc
 *.*sdf
 *.sln
