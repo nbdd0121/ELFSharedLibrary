@@ -4,8 +4,8 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include <elf/elf32.h>
-#include <elf/elf32_dl.h>
+#include <elf/elf64.h>
+#include <elf/elf64_dl.h>
 #include <util/list.h>
 #include <util/hashmap.h>
 
@@ -28,41 +28,9 @@ typedef struct dl_handle_t  {
 static const char* errmsg = NULL;
 static list_t globalHandle = {&globalHandle, &globalHandle};
 
-#ifdef _MSC_VER
-#define aligned_alloc _aligned_malloc
-#define aligned_free _aligned_free
-#else
-#define aligned_free free
-#endif
-
-static void* readFile(const char* name) {
-    FILE* file = fopen(name, "rb");
-    if (file == NULL) {
-        return NULL;
-    }
-    if (fseek(file, 0, SEEK_END) == -1) {
-        return NULL;
-    }
-    long length = ftell(file);
-    if (length == -1) {
-        return NULL;
-    }
-    rewind(file);
-    char* filecontents = malloc(length + 1);
-    if (!filecontents) {
-        return NULL;
-    }
-    if (!fread(filecontents, length, 1, file)) {
-        free(filecontents);
-        return NULL;
-    }
-    if (fclose(file) == -1) {
-        free(filecontents);
-        return NULL;
-    }
-    filecontents[length] = 0;
-    return filecontents;
-}
+void* readFile(const char* name);
+void* alloc_exec(size_t size);
+void free_exec(void* ptr);
 
 static hashmap_t* getDlMap() {
     static hashmap_t* map = NULL;
@@ -80,7 +48,7 @@ static hashmap_t* getGlobalMap(bool init) {
     return map;
 }
 
-static int ELF32_validate(Elf32_Ehdr* header) {
+static int ELF64_validate(Elf64_Ehdr* header) {
     if (header->e_ident[EI_MAG0] != ELFMAG0 ||
             header->e_ident[EI_MAG1] != ELFMAG1 ||
             header->e_ident[EI_MAG2] != ELFMAG2 ||
@@ -88,7 +56,7 @@ static int ELF32_validate(Elf32_Ehdr* header) {
         return 0;
     }
 
-    if (header->e_ident[EI_CLASS] != ELFCLASS32) {
+    if (header->e_ident[EI_CLASS] != ELFCLASS64) {
         return 0;
     }
 
@@ -107,13 +75,13 @@ static int ELF32_validate(Elf32_Ehdr* header) {
     return 1;
 }
 
-static void ELF32_findBounds(Elf32_Ehdr* header, uint32_t* loPtr, uint32_t* hiPtr) {
-    uint32_t lo = 0xFFFFFFFF, hi = 0;
+static void ELF64_findBounds(Elf64_Ehdr* header, uint64_t* loPtr, uint64_t* hiPtr) {
+    uint64_t lo = 0xFFFFFFFF, hi = 0;
     for (int i = 0; i < header->e_phnum; i++) {
-        Elf32_Phdr *program = ELF32_PH_GET(header, i);
+        Elf64_Phdr *program = ELF64_PH_GET(header, i);
         if (program->p_type == PT_LOAD) {
-            uint32_t seglo = program->p_vaddr;
-            uint32_t seghi = seglo + program->p_memsz;
+            uint64_t seglo = program->p_vaddr;
+            uint64_t seghi = seglo + program->p_memsz;
 
             seglo = seglo / program->p_align * program->p_align;
             seghi = ((seghi - 1) / program->p_align + 1)* program->p_align;
@@ -128,19 +96,19 @@ static void ELF32_findBounds(Elf32_Ehdr* header, uint32_t* loPtr, uint32_t* hiPt
         *hiPtr = hi;
 }
 
-static void ELF32_loadProgram(Elf32_Ehdr *header, char* mem) {
+static void ELF64_loadProgram(Elf64_Ehdr *header, char* mem) {
     for (int i = 0; i < header->e_phnum; i++) {
-        Elf32_Phdr *h = ELF32_PH_GET(header, i);
+        Elf64_Phdr *h = ELF64_PH_GET(header, i);
         if (h->p_type == PT_LOAD) {
-            memset(mem + h->p_vaddr + h->p_filesz, 0, h->p_memsz - h->p_filesz);
-            memcpy(mem + h->p_vaddr, ELF32_PH_CONTENT(header, h), h->p_filesz);
+            memset(mem + h->p_vaddr + h->p_filesz, 0, (size_t)(h->p_memsz - h->p_filesz));
+            memcpy(mem + h->p_vaddr, ELF64_PH_CONTENT(header, h), (size_t)h->p_filesz);
         }
     }
 }
 
-static int ELF32_findProgram(Elf32_Ehdr* header, int startIndex, int targetType) {
+static int ELF64_findProgram(Elf64_Ehdr* header, int startIndex, int targetType) {
     for (int i = startIndex; i < header->e_phnum; i++) {
-        Elf32_Phdr *section = ELF32_PH_GET(header, i);
+        Elf64_Phdr *section = ELF64_PH_GET(header, i);
         if (section->p_type == targetType) {
             return i;
         }
@@ -148,7 +116,7 @@ static int ELF32_findProgram(Elf32_Ehdr* header, int startIndex, int targetType)
     return -1;
 }
 
-static void* ELF32_resolveSymbolGlobal(const char* name) {
+static void* ELF64_resolveSymbolGlobal(const char* name) {
     hashmap_t* map = getGlobalMap(false);
     if (map) {
         void* ret = hashmap_get(map, name);
@@ -156,16 +124,16 @@ static void* ELF32_resolveSymbolGlobal(const char* name) {
     }
     dl_handle_t* handle;
     list_forEach(&globalHandle, handle, dl_handle_t, globalList) {
-        void* ret = ELF32_dlsym(handle, name);
+        void* ret = ELF64_dlsym(handle, name);
         if (ret) return ret;
     }
     return NULL;
 }
 
-static bool ELF32_resolveSymbols(dl_handle_t* handle, char* strtab, char *symtab, int size, int syment) {
+static bool ELF64_resolveSymbols(dl_handle_t* handle, char* strtab, char *symtab, int size, uint64_t syment) {
     /* First element is skipeed */
     for (int i = 1; i < size; i++) {
-        Elf32_Sym *symbol = (Elf32_Sym *)(symtab + i * syment);
+        Elf64_Sym *symbol = (Elf64_Sym *)(symtab + i * syment);
 
         if (symbol->st_shndx == SHN_UNDEF) {
             // Undefined symbols, we need to resolve from the dependency list
@@ -173,14 +141,14 @@ static bool ELF32_resolveSymbols(dl_handle_t* handle, char* strtab, char *symtab
             // Get the name of the symbol
             char *name = strtab + symbol->st_name;
 
-            void* result = ELF32_resolveSymbolGlobal(name);
+            void* result = ELF64_resolveSymbolGlobal(name);
             for (size_t i = 0; !result && i < handle->depDlLen; i++) {
-                result = ELF32_dlsym(handle->depDl[i], name);
+                result = ELF64_dlsym(handle->depDl[i], name);
             }
 
             // It is a error if we cannot resolve a strong symbol
             if (!result) {
-                if (!(ELF32_ST_BIND(symbol->st_info) & STB_WEAK)) {
+                if (!(ELF64_ST_BIND(symbol->st_info) & STB_WEAK)) {
                     errmsg = "Unresolved symbol";
                     // printf("[ERROR] [ELF] Failed to resolve %s\n", name);
                     return false;
@@ -188,16 +156,16 @@ static bool ELF32_resolveSymbols(dl_handle_t* handle, char* strtab, char *symtab
             }
 
             symbol->st_shndx = SHN_ABS;
-            symbol->st_value = (uint32_t)result;
+            symbol->st_value = (uint64_t)result;
         } else if (symbol->st_shndx < SHN_LORESERVE) {
             symbol->st_shndx = SHN_ABS;
-            symbol->st_value = (uint32_t)(symbol->st_value + handle->executable);
+            symbol->st_value = (uint64_t)(symbol->st_value + handle->executable);
         } else if (symbol->st_shndx != SHN_ABS) {
             errmsg = "Unimplemented st_shndx";
             return false;
         }
 
-        if (ELF32_ST_BIND(symbol->st_info) & STB_GLOBAL) {
+        if (ELF64_ST_BIND(symbol->st_info) & STB_GLOBAL) {
             char *name = strtab + symbol->st_name;
             hashmap_put(handle->map, name, (void*)symbol->st_value);
         }
@@ -206,75 +174,75 @@ static bool ELF32_resolveSymbols(dl_handle_t* handle, char* strtab, char *symtab
     return true;
 }
 
-static bool ELF32_relocateRel(dl_handle_t* handle, char* reltab, int entsize, int limit, char* symtab, int syment) {
+static bool ELF64_relocateRela(dl_handle_t* handle, char* reltab, uint64_t entsize, uint64_t limit, char* symtab, uint64_t syment) {
     for (char* end = reltab + limit; reltab<end; reltab += entsize) {
-        Elf32_Rel* rel = (Elf32_Rel*)reltab;
-        Elf32_Sym *symbol = (Elf32_Sym *)(symtab + ELF32_R_SYM(rel->r_info) * syment);
-        uint32_t *ref = (uint32_t *)(handle->executable + rel->r_offset);
-        switch (ELF32_R_TYPE(rel->r_info)) {
-            case R_386_GLOB_DAT:
+        Elf64_Rela* rel = (Elf64_Rela*)reltab;
+        Elf64_Sym *symbol = (Elf64_Sym *)(symtab + ELF64_R_SYM(rel->r_info) * syment);
+        uint64_t *ref = (uint64_t *)(handle->executable + rel->r_offset);
+        switch (ELF64_R_TYPE(rel->r_info)) {
+            case R_X86_64_GLOB_DAT:
                 *ref = symbol->st_value;
                 break;
-            case R_386_JMP_SLOT:
+            case R_X86_64_JUMP_SLOT:
                 *ref = symbol->st_value;
                 break;
-            case R_386_RELATIVE:
-                *ref += (int)handle->executable;
+            case R_X86_64_RELATIVE:
+                *ref = rel->r_addend + (int)handle->executable;
                 break;
             default:
                 errmsg = "Unimplemented relocation type";
-                // printf("Unknown relocation type %d\n", ELF32_R_TYPE(rel->r_info));
+                printf("Unknown relocation type %d\n", ELF64_R_TYPE(rel->r_info));
                 return false;
         }
     }
     return true;
 }
 
-static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**initptr)(void)) {
+static void elf64_dlopen_doit(dl_handle_t* handle, Elf64_Ehdr* header, void(**initptr)(void)) {
     // Check header
-    if (!ELF32_validate(header)) {
+    if (!ELF64_validate(header)) {
         errmsg = "Broken shared library";
         return;
     }
 
     // Allocate executable memory
-    uint32_t size;
-    ELF32_findBounds(header, NULL, &size);
-    handle->executable = aligned_alloc(size, 4096);
+    uint64_t size;
+    ELF64_findBounds(header, NULL, &size);
+    handle->executable = alloc_exec((size_t)size);
     if (!handle->executable) {
         errmsg = "Memory allocation failure";
         return;
     }
 
     // Load binary image into memory
-    ELF32_loadProgram(header, handle->executable);
+    ELF64_loadProgram(header, handle->executable);
 
     // Find DYNAMIC section. This is mandatory
-    int dynamicSection = ELF32_findProgram(header, 0, PT_DYNAMIC);
+    int dynamicSection = ELF64_findProgram(header, 0, PT_DYNAMIC);
     if (dynamicSection == -1) {
         errmsg = "Broken shared library";
         return;
     }
 
     char* strtab = NULL;
-    uint32_t strsz = 0;
+    uint64_t strsz = 0;
 
     char* pltgot = NULL;
-    Elf32_Word* hash = NULL;
+    Elf64_Word* hash = NULL;
     char *symtab = NULL;
-    int syment = 0;
+    uint64_t syment = 0;
     int neededLibs = 0;
 
     char* jmpRel = NULL;
-    int32_t pltRel = 0;
-    uint32_t pltrelsz = 0;
+    int64_t pltRel = 0;
+    uint64_t pltrelsz = 0;
 
-    char* rel = NULL;
-    uint32_t relsz = 0;
-    uint32_t relent = 0;
+    char* rela = NULL;
+    uint64_t relasz = 0;
+    uint64_t relaent = 0;
 
     // Initial loop. Retrieve table information
-    for (Elf32_Dyn* dynamics = (Elf32_Dyn*)ELF32_PH_CONTENT(header, ELF32_PH_GET(header, dynamicSection));
+    for (Elf64_Dyn* dynamics = (Elf64_Dyn*)ELF64_PH_CONTENT(header, ELF64_PH_GET(header, dynamicSection));
             dynamics->d_tag != DT_NULL; dynamics++) {
         switch (dynamics->d_tag) {
             case DT_NEEDED:
@@ -287,7 +255,7 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
                 pltgot = ((char*)header + dynamics->d_un.d_ptr);
                 break;
             case DT_HASH:
-                hash = (Elf32_Word*)((char*)header + dynamics->d_un.d_ptr);
+                hash = (Elf64_Word*)((char*)header + dynamics->d_un.d_ptr);
                 break;
             case DT_STRTAB:
                 strtab = (char*)header + dynamics->d_un.d_ptr;
@@ -307,14 +275,14 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
             case DT_FINI:
                 handle->fini = (void(*)(void))(dynamics->d_un.d_ptr + handle->executable);
                 break;
-            case DT_REL:
-                rel = (char*)header + dynamics->d_un.d_ptr;
+            case DT_RELA:
+                rela = (char*)header + dynamics->d_un.d_ptr;
                 break;
-            case DT_RELSZ:
-                relsz = dynamics->d_un.d_val;
+            case DT_RELASZ:
+                relasz = dynamics->d_un.d_val;
                 break;
-            case DT_RELENT:
-                relent = dynamics->d_un.d_val;
+            case DT_RELAENT:
+                relaent = dynamics->d_un.d_val;
                 break;
             case DT_PLTREL:
                 pltRel = dynamics->d_un.d_val;
@@ -327,8 +295,6 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
                 jmpRel = ((char*)header + dynamics->d_un.d_ptr);
                 break;
             case DT_TEXTREL:
-                break;
-            case 0x6FFFFFFA:
                 break;
             default:
                 errmsg = "Unimplemented d_tag";
@@ -343,8 +309,8 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
         return;
     }
 
-    char* dupstrtab = malloc(strsz);
-    memcpy(dupstrtab, strtab, strsz);
+    char* dupstrtab = malloc((size_t)strsz);
+    memcpy(dupstrtab, strtab, (size_t)strsz);
     handle->strtab = dupstrtab;
 
     // Load dependencies
@@ -357,11 +323,11 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
         }
         int processedLibs = 0;
 
-        for (Elf32_Dyn* dynamics = (Elf32_Dyn*)ELF32_PH_CONTENT(header, ELF32_PH_GET(header, dynamicSection));
+        for (Elf64_Dyn* dynamics = (Elf64_Dyn*)ELF64_PH_CONTENT(header, ELF64_PH_GET(header, dynamicSection));
                 dynamics->d_tag != DT_NULL; dynamics++) {
             if (dynamics->d_tag == DT_NEEDED) {
                 char* name = dupstrtab + dynamics->d_un.d_val;
-                dl_handle_t* dephandle = ELF32_dlopen(name, RTLD_LAZY);
+                dl_handle_t* dephandle = ELF64_dlopen(name, RTLD_LAZY);
                 if (!dephandle) {
                     errmsg = "Cannot load dependency";
                     return;
@@ -378,16 +344,16 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
 
     // Resolve symbols
     handle->map = hashmap_new_string(1);
-    if (!ELF32_resolveSymbols(handle, dupstrtab, symtab, hash[1], syment)) {
+    if (!ELF64_resolveSymbols(handle, dupstrtab, symtab, hash[1], syment)) {
         return;
     }
 
-    if (rel) {
-        if (!relsz || !relent) {
+    if (rela) {
+        if (!relasz || !relaent) {
             errmsg = "Broken shared library";
             return;
         }
-        if (!ELF32_relocateRel(handle, rel, relent, relsz, symtab, syment)) {
+        if (!ELF64_relocateRela(handle, rela, relaent, relasz, symtab, syment)) {
             return;
         }
     }
@@ -400,19 +366,19 @@ static void elf32_dlopen_doit(dl_handle_t* handle, Elf32_Ehdr* header, void(**in
             return;
         }
         if (pltRel == DT_RELA) {
-            errmsg = "Unimplemented RELA";
-            return;
-        } else {
-            if (!ELF32_relocateRel(handle, jmpRel, sizeof(Elf32_Rel), pltrelsz, symtab, syment)) {
+            if (!ELF64_relocateRela(handle, jmpRel, sizeof(Elf64_Rela), pltrelsz, symtab, syment)) {
                 return;
             }
+        } else {
+            errmsg = "Unimplemented REL";
+            return;
         }
     }
 
     handle->resolved = true;
 }
 
-void* ELF32_dlopen(const char* name, int flags) {
+void* ELF64_dlopen(const char* name, int flags) {
     // A shared library will only be attached once
     dl_handle_t* handle = hashmap_get(getDlMap(), name);
     if (handle) {
@@ -420,7 +386,7 @@ void* ELF32_dlopen(const char* name, int flags) {
         return handle;
     }
 
-    Elf32_Ehdr* header = readFile(name);
+    Elf64_Ehdr* header = readFile(name);
     if (!header) {
         errmsg = "Cannot open the shared library";
         return NULL;
@@ -444,11 +410,11 @@ void* ELF32_dlopen(const char* name, int flags) {
 
     void(*init)(void) = NULL;
 
-    elf32_dlopen_doit(handle, header, &init);
+    elf64_dlopen_doit(handle, header, &init);
     free(header);
 
     if (!handle->resolved) {
-        ELF32_dlclose(handle);
+        ELF64_dlclose(handle);
         return NULL;
     }
 
@@ -462,7 +428,7 @@ void* ELF32_dlopen(const char* name, int flags) {
     return handle;
 }
 
-void ELF32_dlclose(void* handle) {
+void ELF64_dlclose(void* handle) {
     dl_handle_t* thandle = (dl_handle_t*)handle;
     if (--thandle->refCount) return;
 
@@ -479,31 +445,31 @@ void ELF32_dlclose(void* handle) {
     if (thandle->depDl) {
         for (size_t i = 0; i < thandle->depDlLen; i++) {
             if (thandle->depDl[i])
-                ELF32_dlclose(thandle->depDl[i]);
+                ELF64_dlclose(thandle->depDl[i]);
         }
         free(thandle->depDl);
     }
     if (thandle->map)
         hashmap_dispose(thandle->map);
     if (thandle->executable)
-        aligned_free(thandle->executable);
+        free_exec(thandle->executable);
     if (thandle->strtab)
         free(thandle->strtab);
     free(thandle->name);
     free(thandle);
 }
 
-void* ELF32_dlsym(void* handle, const char* name) {
+void* ELF64_dlsym(void* handle, const char* name) {
     dl_handle_t* thandle = (dl_handle_t*)handle;
     return hashmap_get(thandle->map, name);
 }
 
-char* ELF32_dlerror(void) {
+char* ELF64_dlerror(void) {
     char* msg = (char*)errmsg;
     errmsg = NULL;
     return msg;
 }
 
-void ELF32_addGlobalSymbol(const char* name, void* symbol) {
+void ELF64_addGlobalSymbol(const char* name, void* symbol) {
     hashmap_put(getGlobalMap(true), name, symbol);
 }
